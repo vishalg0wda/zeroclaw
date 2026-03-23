@@ -456,6 +456,105 @@ impl WhatsAppWebChannel {
         );
         Ok(())
     }
+
+    /// Send a voice file (from disk) as a WhatsApp PTT voice note.
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_voice_file(
+        client: &wa_rs::Client,
+        to: &wa_rs_binary::jid::Jid,
+        path: &std::path::Path,
+    ) -> Result<()> {
+        let audio_bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| anyhow!("Failed to read voice file {}: {e}", path.display()))?;
+        let audio_len = audio_bytes.len();
+        tracing::info!(
+            "WhatsApp Web voice file: read {} bytes from {}",
+            audio_len,
+            path.display()
+        );
+
+        if audio_bytes.is_empty() {
+            anyhow::bail!("Voice file is empty: {}", path.display());
+        }
+
+        use wa_rs_core::download::MediaType;
+        let upload = client
+            .upload(audio_bytes, MediaType::Audio)
+            .await
+            .map_err(|e| anyhow!("Failed to upload voice file: {e}"))?;
+
+        tracing::info!(
+            "WhatsApp Web voice file: uploaded (url_len={}, file_length={})",
+            upload.url.len(),
+            upload.file_length
+        );
+
+        // Estimate duration: Opus at ~32kbps -> bytes / 4000 ~ seconds
+        #[allow(clippy::cast_possible_truncation)]
+        let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
+
+        let voice_msg = wa_rs_proto::whatsapp::Message {
+            audio_message: Some(Box::new(wa_rs_proto::whatsapp::message::AudioMessage {
+                url: Some(upload.url),
+                direct_path: Some(upload.direct_path),
+                media_key: Some(upload.media_key),
+                file_enc_sha256: Some(upload.file_enc_sha256),
+                file_sha256: Some(upload.file_sha256),
+                file_length: Some(upload.file_length),
+                mimetype: Some("audio/ogg; codecs=opus".to_string()),
+                ptt: Some(true),
+                seconds: Some(estimated_seconds),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        Box::pin(client.send_message(to.clone(), voice_msg))
+            .await
+            .map_err(|e| anyhow!("Failed to send voice note: {e}"))?;
+        tracing::info!(
+            "WhatsApp Web voice file: sent PTT ({} bytes, ~{}s) from {}",
+            audio_len,
+            estimated_seconds,
+            path.display()
+        );
+        Ok(())
+    }
+
+    /// Extract `[VOICE:/path/to/file]` markers from text, returning the
+    /// cleaned text and a list of file paths to send as voice notes.
+    fn parse_voice_markers(text: &str) -> (String, Vec<String>) {
+        // Simple state-machine parser matching [VOICE:...] markers.
+        let mut cleaned = String::with_capacity(text.len());
+        let mut paths = Vec::new();
+        let mut cursor = 0;
+
+        while cursor < text.len() {
+            if let Some(marker_start) = text[cursor..].find("[VOICE:") {
+                let abs_start = cursor + marker_start;
+                cleaned.push_str(&text[cursor..abs_start]);
+
+                let after_tag = abs_start + "[VOICE:".len();
+                if let Some(close_rel) = text[after_tag..].find(']') {
+                    let path = text[after_tag..after_tag + close_rel].trim();
+                    if !path.is_empty() {
+                        paths.push(path.to_string());
+                    }
+                    cursor = after_tag + close_rel + 1;
+                } else {
+                    // No closing bracket — keep the text as-is
+                    cleaned.push_str(&text[abs_start..]);
+                    break;
+                }
+            } else {
+                cleaned.push_str(&text[cursor..]);
+                break;
+            }
+        }
+
+        (cleaned.trim().to_string(), paths)
+    }
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -565,18 +664,34 @@ impl Channel for WhatsAppWebChannel {
             // Fall through to send text normally (voice chat gets BOTH)
         }
 
-        // Send text message
-        let outgoing = wa_rs_proto::whatsapp::Message {
-            conversation: Some(message.content.clone()),
-            ..Default::default()
-        };
+        // Parse [VOICE:/path] markers from content
+        let (remaining_text, voice_paths) = Self::parse_voice_markers(&message.content);
 
-        let message_id = client.send_message(to, outgoing).await?;
-        tracing::debug!(
-            "WhatsApp Web: sent text to {} (id: {})",
-            message.recipient,
-            message_id
-        );
+        // Send each voice file as a PTT voice note
+        for path_str in &voice_paths {
+            let path = std::path::Path::new(path_str);
+            if let Err(e) = Self::send_voice_file(&client, &to, path).await {
+                tracing::warn!(
+                    "WhatsApp Web: failed to send voice file {}: {e}",
+                    path_str
+                );
+            }
+        }
+
+        // Send remaining text (skip if empty after stripping markers)
+        if !remaining_text.is_empty() {
+            let outgoing = wa_rs_proto::whatsapp::Message {
+                conversation: Some(remaining_text),
+                ..Default::default()
+            };
+
+            let message_id = client.send_message(to, outgoing).await?;
+            tracing::debug!(
+                "WhatsApp Web: sent text to {} (id: {})",
+                message.recipient,
+                message_id
+            );
+        }
         Ok(())
     }
 
