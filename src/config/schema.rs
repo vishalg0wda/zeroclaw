@@ -11442,6 +11442,8 @@ channel_id = "C123"
                 dm_policy: WhatsAppChatPolicy::default(),
                 group_policy: WhatsAppChatPolicy::default(),
                 self_chat_mode: false,
+                mention_only: false,
+                mention_keywords: vec![],
                 proxy_url: None,
             }),
             linq: None,
