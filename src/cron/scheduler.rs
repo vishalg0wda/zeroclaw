@@ -520,6 +520,8 @@ pub(crate) async fn deliver_announcement(
                     wa.dm_policy.clone(),
                     wa.group_policy.clone(),
                     wa.self_chat_mode,
+                    wa.mention_only,
+                    wa.mention_keywords.clone(),
                 );
                 channel.send(&SendMessage::new(output, target)).await?;
             }

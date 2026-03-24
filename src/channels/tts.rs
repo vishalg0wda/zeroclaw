@@ -140,6 +140,8 @@ pub struct ElevenLabsTtsProvider {
     model_id: String,
     stability: f64,
     similarity_boost: f64,
+    /// ElevenLabs output_format query param (e.g. "mp3_44100_128", "opus_48000_64").
+    output_format: Option<String>,
     client: reqwest::Client,
 }
 
@@ -168,6 +170,7 @@ impl ElevenLabsTtsProvider {
             model_id: config.model_id.clone(),
             stability: config.stability,
             similarity_boost: config.similarity_boost,
+            output_format: config.output_format.clone(),
             client: reqwest::Client::builder()
                 .timeout(TTS_HTTP_TIMEOUT)
                 .build()
@@ -189,7 +192,10 @@ impl TtsProvider for ElevenLabsTtsProvider {
         {
             bail!("ElevenLabs voice ID contains invalid characters: {voice}");
         }
-        let url = format!("https://api.elevenlabs.io/v1/text-to-speech/{voice}");
+        let mut url = format!("https://api.elevenlabs.io/v1/text-to-speech/{voice}");
+        if let Some(ref fmt) = self.output_format {
+            url = format!("{url}?output_format={fmt}");
+        }
         let body = serde_json::json!({
             "text": text,
             "model_id": self.model_id,

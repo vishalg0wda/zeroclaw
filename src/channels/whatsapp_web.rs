@@ -66,6 +66,13 @@ pub struct WhatsAppWebChannel {
     group_policy: crate::config::WhatsAppChatPolicy,
     /// Whether to always respond in self-chat when mode = personal
     self_chat_mode: bool,
+    /// When true, only respond in groups when mentioned by keyword or replied to
+    mention_only: bool,
+    /// Keywords that trigger a group response (case-insensitive, word-boundary)
+    mention_keywords: Vec<String>,
+    /// Message IDs sent by this bot, used to detect reply-to-bot in groups.
+    /// Bounded ring buffer — keeps the most recent N IDs.
+    sent_message_ids: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Client handle for sending messages and typing indicators
@@ -108,6 +115,8 @@ impl WhatsAppWebChannel {
         dm_policy: crate::config::WhatsAppChatPolicy,
         group_policy: crate::config::WhatsAppChatPolicy,
         self_chat_mode: bool,
+        mention_only: bool,
+        mention_keywords: Vec<String>,
     ) -> Self {
         Self {
             session_path,
@@ -118,6 +127,11 @@ impl WhatsAppWebChannel {
             dm_policy,
             group_policy,
             self_chat_mode,
+            mention_only,
+            mention_keywords,
+            sent_message_ids: Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::with_capacity(256),
+            )),
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
@@ -144,6 +158,121 @@ impl WhatsAppWebChannel {
             self.tts_config = Some(config);
         }
         self
+    }
+
+    /// Maximum number of sent message IDs to track for reply-to-bot detection.
+    const SENT_ID_RING_SIZE: usize = 256;
+
+    /// Record a message ID that this bot sent, for reply-to-bot detection.
+    #[cfg(feature = "whatsapp-web")]
+    fn track_sent_message_id(&self, id: String) {
+        if let Ok(mut ring) = self.sent_message_ids.lock() {
+            if ring.len() >= Self::SENT_ID_RING_SIZE {
+                ring.pop_front();
+            }
+            ring.push_back(id);
+        }
+    }
+
+    /// Check if a stanza ID belongs to a message this bot sent.
+    #[cfg(feature = "whatsapp-web")]
+    fn is_reply_to_bot(&self, stanza_id: &str) -> bool {
+        self.sent_message_ids
+            .lock()
+            .map(|ring| ring.iter().any(|id| id == stanza_id))
+            .unwrap_or(false)
+    }
+
+    /// Check if any mention keyword appears in the text (case-insensitive, word boundary).
+    /// Returns true if the text contains any of the configured mention keywords.
+    #[cfg(feature = "whatsapp-web")]
+    fn text_mentions_bot(text: &str, keywords: &[String]) -> bool {
+        if keywords.is_empty() {
+            return false;
+        }
+        let lower = text.to_lowercase();
+        keywords.iter().any(|kw| {
+            let kw_lower = kw.to_lowercase();
+            // Find all occurrences and check word boundaries
+            let mut start = 0;
+            while let Some(pos) = lower[start..].find(&kw_lower) {
+                let abs_pos = start + pos;
+                let end_pos = abs_pos + kw_lower.len();
+                let at_word_start =
+                    abs_pos == 0 || !lower.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
+                let at_word_end = end_pos >= lower.len()
+                    || !lower.as_bytes()[end_pos].is_ascii_alphanumeric();
+                if at_word_start && at_word_end {
+                    return true;
+                }
+                start = abs_pos + 1;
+            }
+            false
+        })
+    }
+
+    /// Extract the quoted message stanza ID from a wa-rs Message, if present.
+    /// Checks `extended_text_message.context_info.stanza_id` and common message
+    /// types that carry `context_info`.
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_quoted_stanza_id(msg: &wa_rs_proto::whatsapp::Message) -> Option<&str> {
+        // Extended text (most common for replies)
+        if let Some(ref ext) = msg.extended_text_message {
+            if let Some(ref ctx) = ext.context_info {
+                if let Some(ref id) = ctx.stanza_id {
+                    if !id.is_empty() {
+                        return Some(id.as_str());
+                    }
+                }
+            }
+        }
+        // Conversation messages don't carry context_info in the proto, but
+        // image/video/audio/document replies do.
+        macro_rules! check_context {
+            ($field:ident) => {
+                if let Some(ref inner) = msg.$field {
+                    if let Some(ref ctx) = inner.context_info {
+                        if let Some(ref id) = ctx.stanza_id {
+                            if !id.is_empty() {
+                                return Some(id.as_str());
+                            }
+                        }
+                    }
+                }
+            };
+        }
+        check_context!(image_message);
+        check_context!(video_message);
+        check_context!(audio_message);
+        check_context!(document_message);
+        None
+    }
+
+    /// Determine whether the bot should respond to this group message.
+    /// Returns `true` if:
+    ///   - `mention_only` is false (respond to everything per policy), OR
+    ///   - The message text mentions the bot by keyword, OR
+    ///   - The message is a reply to one of the bot's own messages.
+    #[cfg(feature = "whatsapp-web")]
+    fn should_respond_in_group(
+        &self,
+        msg: &wa_rs_proto::whatsapp::Message,
+        text: &str,
+    ) -> bool {
+        if !self.mention_only {
+            return true;
+        }
+        // Check keyword mentions
+        if Self::text_mentions_bot(text, &self.mention_keywords) {
+            return true;
+        }
+        // Check reply-to-bot
+        if let Some(stanza_id) = Self::extract_quoted_stanza_id(msg) {
+            if self.is_reply_to_bot(stanza_id) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Check if a phone number is allowed (E.164 format: +1234567890)
@@ -426,9 +555,9 @@ impl WhatsAppWebChannel {
             upload.file_length
         );
 
-        // Estimate duration: Opus at ~32kbps → bytes / 4000 ≈ seconds
+        // Estimate duration: Opus at ~48kbps → bytes / 6000 ≈ seconds
         #[allow(clippy::cast_possible_truncation)]
-        let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
+        let estimated_seconds = std::cmp::max(1, (upload.file_length / 6000) as u32);
 
         let voice_msg = wa_rs_proto::whatsapp::Message {
             audio_message: Some(Box::new(wa_rs_proto::whatsapp::message::AudioMessage {
@@ -744,6 +873,8 @@ impl Channel for WhatsAppWebChannel {
             };
 
             let message_id = client.send_message(to, outgoing).await?;
+            // Track sent ID for reply-to-bot detection in groups
+            self.track_sent_message_id(message_id.clone());
             tracing::debug!(
                 "WhatsApp Web: sent text to {} (id: {})",
                 message.recipient,
@@ -822,6 +953,9 @@ impl Channel for WhatsAppWebChannel {
             let wa_dm_policy = self.dm_policy.clone();
             let wa_group_policy = self.group_policy.clone();
             let wa_self_chat_mode = self.self_chat_mode;
+            let wa_mention_only = self.mention_only;
+            let wa_mention_keywords = self.mention_keywords.clone();
+            let wa_sent_ids = self.sent_message_ids.clone();
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
@@ -838,6 +972,8 @@ impl Channel for WhatsAppWebChannel {
                     let wa_mode = wa_mode.clone();
                     let wa_dm_policy = wa_dm_policy.clone();
                     let wa_group_policy = wa_group_policy.clone();
+                    let wa_mention_keywords = wa_mention_keywords.clone();
+                    let wa_sent_ids = wa_sent_ids.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
@@ -909,6 +1045,33 @@ impl Channel for WhatsAppWebChannel {
                                             crate::config::WhatsAppChatPolicy::Allowlist => {
                                                 // already filtered by allowed_numbers above
                                             }
+                                        }
+
+                                        // ── mention_only gate for groups ──
+                                        if wa_mention_only {
+                                            let text_preview = msg.text_content().unwrap_or("");
+                                            let mentioned = Self::text_mentions_bot(
+                                                text_preview,
+                                                &wa_mention_keywords,
+                                            );
+                                            let replied_to_bot = Self::extract_quoted_stanza_id(&msg)
+                                                .map(|sid| {
+                                                    wa_sent_ids
+                                                        .lock()
+                                                        .map(|ring| ring.iter().any(|id| id == sid))
+                                                        .unwrap_or(false)
+                                                })
+                                                .unwrap_or(false);
+
+                                            if !mentioned && !replied_to_bot {
+                                                tracing::debug!(
+                                                    "WhatsApp Web: ignoring group message (mention_only=true, no mention or reply-to-bot)"
+                                                );
+                                                return;
+                                            }
+                                            tracing::info!(
+                                                "WhatsApp Web: group message passed mention_only gate (mentioned={mentioned}, replied_to_bot={replied_to_bot})"
+                                            );
                                         }
                                     } else {
                                         // DM (non-self)
@@ -1236,6 +1399,8 @@ impl WhatsAppWebChannel {
         _dm_policy: crate::config::WhatsAppChatPolicy,
         _group_policy: crate::config::WhatsAppChatPolicy,
         _self_chat_mode: bool,
+        _mention_only: bool,
+        _mention_keywords: Vec<String>,
     ) -> Self {
         Self { _private: () }
     }
@@ -1306,6 +1471,8 @@ mod tests {
             crate::config::WhatsAppChatPolicy::default(),
             crate::config::WhatsAppChatPolicy::default(),
             false,
+            false,
+            vec![],
         )
     }
 
@@ -1336,6 +1503,8 @@ mod tests {
             crate::config::WhatsAppChatPolicy::default(),
             crate::config::WhatsAppChatPolicy::default(),
             false,
+            false,
+            vec![],
         );
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(ch.is_number_allowed("+9999999999"));
@@ -1353,6 +1522,8 @@ mod tests {
             crate::config::WhatsAppChatPolicy::default(),
             crate::config::WhatsAppChatPolicy::default(),
             false,
+            false,
+            vec![],
         );
         // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
         assert!(!ch.is_number_allowed("+1234567890"));
@@ -1540,5 +1711,80 @@ mod tests {
                 "/tmp/test.db-shm".to_string(),
             ]
         );
+    }
+
+    // ── mention_only / keyword detection tests ──
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn text_mentions_bot_exact_word() {
+        let kw = vec!["nograj".into()];
+        assert!(WhatsAppWebChannel::text_mentions_bot("hey nograj what's up", &kw));
+        assert!(WhatsAppWebChannel::text_mentions_bot("Nograj help me", &kw));
+        assert!(WhatsAppWebChannel::text_mentions_bot("NOGRAJ!", &kw));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn text_mentions_bot_no_partial_match() {
+        let kw = vec!["nograj".into()];
+        // "nograjji" should NOT match — keyword must be at a word boundary
+        assert!(!WhatsAppWebChannel::text_mentions_bot("nograjji is funny", &kw));
+        assert!(!WhatsAppWebChannel::text_mentions_bot("no mention here", &kw));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn text_mentions_bot_multiple_keywords() {
+        let kw = vec!["nograj".into(), "boss".into()];
+        assert!(WhatsAppWebChannel::text_mentions_bot("hey boss", &kw));
+        assert!(WhatsAppWebChannel::text_mentions_bot("ask nograj", &kw));
+        assert!(!WhatsAppWebChannel::text_mentions_bot("no keywords here", &kw));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn text_mentions_bot_empty_keywords() {
+        assert!(!WhatsAppWebChannel::text_mentions_bot("anything", &[]));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn text_mentions_bot_at_boundaries() {
+        let kw = vec!["nograj".into()];
+        // Start of string
+        assert!(WhatsAppWebChannel::text_mentions_bot("nograj, help", &kw));
+        // End of string
+        assert!(WhatsAppWebChannel::text_mentions_bot("hey nograj", &kw));
+        // With punctuation
+        assert!(WhatsAppWebChannel::text_mentions_bot("@nograj help", &kw));
+        assert!(WhatsAppWebChannel::text_mentions_bot("hey, nograj!", &kw));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn sent_message_id_tracking() {
+        let ch = make_channel();
+        ch.track_sent_message_id("msg_001".into());
+        ch.track_sent_message_id("msg_002".into());
+        assert!(ch.is_reply_to_bot("msg_001"));
+        assert!(ch.is_reply_to_bot("msg_002"));
+        assert!(!ch.is_reply_to_bot("msg_999"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn sent_message_id_ring_buffer_eviction() {
+        let ch = make_channel();
+        // Fill beyond ring size
+        for i in 0..300 {
+            ch.track_sent_message_id(format!("msg_{i}"));
+        }
+        // Oldest should be evicted (ring size is 256)
+        assert!(!ch.is_reply_to_bot("msg_0"));
+        assert!(!ch.is_reply_to_bot("msg_43"));
+        // Recent should still be present
+        assert!(ch.is_reply_to_bot("msg_299"));
+        assert!(ch.is_reply_to_bot("msg_250"));
     }
 }

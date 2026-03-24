@@ -1094,6 +1094,11 @@ pub struct ElevenLabsTtsConfig {
     /// Similarity boost (0.0-1.0, default `0.5`).
     #[serde(default = "default_elevenlabs_similarity_boost")]
     pub similarity_boost: f64,
+    /// ElevenLabs output format passed as `output_format` query parameter.
+    /// Examples: `"mp3_44100_128"`, `"opus_48000_64"`, `"pcm_16000"`.
+    /// If unset, ElevenLabs returns its default (mp3_44100_128).
+    #[serde(default)]
+    pub output_format: Option<String>,
 }
 
 /// Google Cloud TTS provider configuration.
@@ -5775,6 +5780,17 @@ pub struct WhatsAppConfig {
     /// user's own self-chat (Notes to Self). Defaults to false.
     #[serde(default)]
     pub self_chat_mode: bool,
+    /// When true, only respond to group messages that mention the bot by name
+    /// or are replies to the bot's own messages. Direct messages are always
+    /// processed. The bot's names are configured via `mention_keywords`.
+    #[serde(default)]
+    pub mention_only: bool,
+    /// Keywords that trigger a response in groups when `mention_only = true`.
+    /// Case-insensitive word-boundary matching. Example: `["nograj", "boss"]`.
+    /// If empty and `mention_only = true`, the bot only responds to direct
+    /// replies to its own messages in groups.
+    #[serde(default)]
+    pub mention_keywords: Vec<String>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
