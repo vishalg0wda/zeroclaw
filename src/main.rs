@@ -518,6 +518,32 @@ Examples:
         quick: bool,
     },
 
+    /// Synthesize text to speech
+    #[command(long_about = "\
+Synthesize text to speech using the configured TTS provider.
+
+Uses the default voice from config.toml unless overridden with --voice. \
+Audio is written to the specified output file (default: output.mp3).
+
+Examples:
+  zeroclaw tts 'Hello world'
+  zeroclaw tts 'Hello world' --voice nova
+  zeroclaw tts 'Hello world' --voice nova --provider openai
+  zeroclaw tts 'Hello world' -o greeting.mp3")]
+    Tts {
+        /// Text to synthesize
+        text: String,
+        /// Voice ID (overrides config default_voice)
+        #[arg(long)]
+        voice: Option<String>,
+        /// TTS provider (overrides config default_provider)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Output file path (default: output.mp3)
+        #[arg(short, long, default_value = "output.mp3")]
+        output: PathBuf,
+    },
+
     /// Generate shell completion script to stdout
     #[command(long_about = "\
 Generate shell completion scripts for `zeroclaw`.
@@ -1342,6 +1368,33 @@ async fn main() -> Result<()> {
             } else {
                 commands::update::run(version.as_deref()).await
             }
+        }
+
+        Commands::Tts {
+            text,
+            voice,
+            provider,
+            output,
+        } => {
+            if !config.tts.enabled {
+                bail!("TTS is disabled. Set [tts].enabled = true in config.toml");
+            }
+            let tts_manager = channels::tts::TtsManager::new(&config.tts)?;
+            let voice = voice.as_deref().unwrap_or(&config.tts.default_voice);
+            let provider = provider.as_deref().unwrap_or(&config.tts.default_provider);
+            let audio_bytes = tts_manager
+                .synthesize_with_provider(&text, provider, voice)
+                .await?;
+            std::fs::write(&output, &audio_bytes)
+                .with_context(|| format!("Failed to write audio to {}", output.display()))?;
+            println!(
+                "Synthesized {} bytes to {} (provider={}, voice={})",
+                audio_bytes.len(),
+                output.display(),
+                provider,
+                voice,
+            );
+            Ok(())
         }
 
         Commands::SelfTest { quick } => {
