@@ -1068,7 +1068,13 @@ impl Channel for WhatsAppWebChannel {
 
                                 // ── mention_only gate for groups (applies in all modes) ──
                                 if wa_mention_only && chat.contains("@g.us") {
-                                    let text_preview = msg.text_content().unwrap_or("");
+                                    // text_content() returns `conversation` (plain text).
+                                    // @-mentions are sent as `extended_text_message` with
+                                    // the mention inline in `.text`. Check both.
+                                    let text_preview = msg.text_content()
+                                        .or_else(|| msg.extended_text_message.as_ref()
+                                            .and_then(|ext| ext.text.as_deref()))
+                                        .unwrap_or("");
                                     let mentioned = Self::text_mentions_bot(
                                         text_preview,
                                         &wa_mention_keywords,
@@ -1125,7 +1131,10 @@ impl Channel for WhatsAppWebChannel {
                                     if let Ok(mut vs) = voice_chats.lock() {
                                         vs.remove(&chat);
                                     }
-                                    let text = msg.text_content().unwrap_or("");
+                                    let text = msg.text_content()
+                                        .or_else(|| msg.extended_text_message.as_ref()
+                                            .and_then(|ext| ext.text.as_deref()))
+                                        .unwrap_or("");
                                     text.trim().to_string()
                                 };
 
