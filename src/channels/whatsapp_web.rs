@@ -1089,8 +1089,9 @@ impl Channel for WhatsAppWebChannel {
                                         .unwrap_or(false);
 
                                     if !mentioned && !replied_to_bot {
-                                        tracing::debug!(
-                                            "WhatsApp Web: ignoring group message (mention_only=true, no mention or reply-to-bot)"
+                                        tracing::warn!(
+                                            "WhatsApp Web: ignoring group message (mention_only=true, no mention or reply-to-bot, text_preview={:?})",
+                                            text_preview
                                         );
                                         return;
                                     }
