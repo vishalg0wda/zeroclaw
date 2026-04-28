@@ -1047,32 +1047,6 @@ impl Channel for WhatsAppWebChannel {
                                             }
                                         }
 
-                                        // ── mention_only gate for groups ──
-                                        if wa_mention_only {
-                                            let text_preview = msg.text_content().unwrap_or("");
-                                            let mentioned = Self::text_mentions_bot(
-                                                text_preview,
-                                                &wa_mention_keywords,
-                                            );
-                                            let replied_to_bot = Self::extract_quoted_stanza_id(&msg)
-                                                .map(|sid| {
-                                                    wa_sent_ids
-                                                        .lock()
-                                                        .map(|ring| ring.iter().any(|id| id == sid))
-                                                        .unwrap_or(false)
-                                                })
-                                                .unwrap_or(false);
-
-                                            if !mentioned && !replied_to_bot {
-                                                tracing::debug!(
-                                                    "WhatsApp Web: ignoring group message (mention_only=true, no mention or reply-to-bot)"
-                                                );
-                                                return;
-                                            }
-                                            tracing::info!(
-                                                "WhatsApp Web: group message passed mention_only gate (mentioned={mentioned}, replied_to_bot={replied_to_bot})"
-                                            );
-                                        }
                                     } else {
                                         // DM (non-self)
                                         match wa_dm_policy {
@@ -1090,6 +1064,33 @@ impl Channel for WhatsAppWebChannel {
                                             }
                                         }
                                     }
+                                }
+
+                                // ── mention_only gate for groups (applies in all modes) ──
+                                if wa_mention_only && chat.contains("@g.us") {
+                                    let text_preview = msg.text_content().unwrap_or("");
+                                    let mentioned = Self::text_mentions_bot(
+                                        text_preview,
+                                        &wa_mention_keywords,
+                                    );
+                                    let replied_to_bot = Self::extract_quoted_stanza_id(&msg)
+                                        .map(|sid| {
+                                            wa_sent_ids
+                                                .lock()
+                                                .map(|ring| ring.iter().any(|id| id == sid))
+                                                .unwrap_or(false)
+                                        })
+                                        .unwrap_or(false);
+
+                                    if !mentioned && !replied_to_bot {
+                                        tracing::debug!(
+                                            "WhatsApp Web: ignoring group message (mention_only=true, no mention or reply-to-bot)"
+                                        );
+                                        return;
+                                    }
+                                    tracing::info!(
+                                        "WhatsApp Web: group message passed mention_only gate (mentioned={mentioned}, replied_to_bot={replied_to_bot})"
+                                    );
                                 }
 
                                 // Attempt voice note transcription (ptt = push-to-talk = voice note)
