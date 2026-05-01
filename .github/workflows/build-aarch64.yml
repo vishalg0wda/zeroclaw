@@ -1,7 +1,7 @@
 name: Build aarch64 with whatsapp-web
 on:
   push:
-    branches: [feat/whatsapp-voice-markers]
+    branches: [master, feat/*, fix/*]
   workflow_dispatch:
 jobs:
   build:
