@@ -153,6 +153,8 @@ impl crate::observability::Observer for BroadcastObserver {
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
-        self
+        // Delegate to inner observer so downcast_ref (e.g. for PrometheusObserver)
+        // works through the BroadcastObserver wrapper.
+        self.inner.as_any()
     }
 }
