@@ -1,7 +1,12 @@
 name: Build aarch64 with whatsapp-web
 on:
   push:
-    branches: [master, feat/*, fix/*]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'web/**'
+      - '.github/workflows/build-aarch64.yml'
   workflow_dispatch:
 jobs:
   build:
